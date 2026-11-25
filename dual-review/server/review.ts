@@ -49,7 +49,7 @@ export function startReview(input: RpcInput<typeof startDualReview>, { paseo }: 
             title: `dual-review: ${r.name}`,
             prompt: r.prompt(target),
           });
-          const result = await agent.waitForFinish(TIMEOUT_MS);
+          const result = await waitUntilSettled(agent, Date.now() + TIMEOUT_MS);
           const text =
             result.status === "idle"
               ? (result.lastMessage ?? "")
@@ -69,6 +69,29 @@ export function startReview(input: RpcInput<typeof startDualReview>, { paseo }: 
     }
   })();
   return { runDir };
+}
+
+type AgentHandle = ReturnType<PluginHandlerContext["paseo"]["agents"]["ref"]>;
+const POLL_MS = 5000;
+const SETTLE_POLLS = 3;
+
+// waitForFinish returns at the first idle, but Claude ends its turn while background subagents
+// still run and only writes the real report in a later turn. Done = idle, no background work,
+// and the same last message for SETTLE_POLLS polls in a row. On an idle agent waitForFinish
+// returns at once with the current last message, so it doubles as a cheap read.
+async function waitUntilSettled(agent: AgentHandle, deadline: number) {
+  let stable = 0;
+  let prev: string | null | undefined;
+  for (;;) {
+    const result = await agent.waitForFinish(Math.max(1000, deadline - Date.now()));
+    if (result.status !== "idle") return result;
+    const busy = (await agent.backgroundWork.list()).length > 0;
+    stable = !busy && result.lastMessage === prev ? stable + 1 : 0;
+    prev = result.lastMessage;
+    if (stable >= SETTLE_POLLS) return result;
+    if (Date.now() >= deadline) return { ...result, status: "timeout" as const };
+    await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+  }
 }
 
 async function writeDiff(cwd: string, runDir: string): Promise<string> {
